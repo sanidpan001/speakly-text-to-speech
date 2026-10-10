@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Speakly — Free Text to Speech Reader with Voice Picker & Word Highlight</title>
+<meta name="description" content="Speakly is a free online text to speech reader. Pick any voice on your device, tune rate and pitch, follow the live word highlight, and listen to long articles hands-free. No signup, unlimited use.">
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<style>
+  :root{ --sun:#EA580C; --sun2:#F97316; --amber:#F59E0B; --cream:#FFF7ED; --ink:#431407; }
+  html{ scroll-behavior:smooth; }
+  body{ font-family:'Sora',system-ui,sans-serif; background:var(--cream); color:var(--ink); }
+  .serif{ font-family:'Source Serif 4',Georgia,serif; }
+  .sunset-grad{ background:linear-gradient(120deg,#9A3412 0%,#EA580C 38%,#F97316 62%,#F59E0B 100%); }
+  .stage-shadow{ box-shadow:0 30px 60px -18px rgba(154,52,18,.45), 0 12px 24px -12px rgba(234,88,12,.35); }
+  .disc{ background:conic-gradient(from 210deg,#FDBA74,#EA580C,#9A3412,#F59E0B,#FDBA74); }
+  .spinning{ animation:spin 9s linear infinite; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+  .eqbar{ animation:eq 1s ease-in-out infinite; transform-origin:bottom; }
+  @keyframes eq{ 0%,100%{ transform:scaleY(.35);} 50%{ transform:scaleY(1);} }
+  .paused-anim .eqbar, .idle .eqbar{ animation-play-state:paused; transform:scaleY(.35); }
+  input[type=range]{ -webkit-appearance:none; appearance:none; height:8px; border-radius:9999px; background:linear-gradient(90deg,#FDBA74,#EA580C); outline:none; }
+  input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; width:24px; height:24px; border-radius:50%; background:#fff; border:3px solid #EA580C; box-shadow:0 2px 8px rgba(154,52,18,.4); cursor:pointer; }
+  input[type=range]::-moz-range-thumb{ width:22px; height:22px; border-radius:50%; background:#fff; border:3px solid #EA580C; cursor:pointer; }
+  .word{ border-radius:.3rem; padding:0 .08em; transition:background .12s ease,color .12s ease; }
+  .word.spoken{ color:#9A3412; opacity:.55; }
+  .word.now{ background:#FDE68A; color:#7C2D12; box-shadow:0 0 0 2px #F59E0B inset; font-weight:600; }
+  .chip{ transition:all .15s ease; }
+  .chip:hover{ transform:translateY(-1px); }
+  .chip.active{ background:#431407; color:#FFEDD5; border-color:#431407; }
+  select{ background-image:none; }
+  ::selection{ background:#FDBA74; }
+</style>
+<script id="lib-speakly">
+/* Speakly — pure text-to-speech preparation logic. No DOM, no browser APIs. */
+var SpeaklyLib = (function () {
+  'use strict';
+
+  var BASE_WPM = 165; /* average English speaking rate at rate = 1 */
+  var DEFAULT_MAX_CHUNK = 180;
+  var MAX_CHUNK_LIMIT = 500;
+
+  function normalizeText(text) {
+    if (text === null || text === undefined) return '';
+    return String(text).replace(/\s+/g, ' ').trim();
+  }
+
+  function countWords(text) {
+    var t = normalizeText(text);
+    if (!t) return 0;
+    return t.split(' ').length;
+  }
+
+  /*
+   * Split raw text into word tokens with absolute character offsets into
+   * the ORIGINAL string, so speech boundary events (charIndex) can be
+   * mapped back to the exact word being spoken.
+   */
+  function tokenizeWords(text) {
+    if (text === null || text === undefined) return [];
+    var str = String(text);
+    var tokens = [];
+    var re = /\S+/g;
+    var m;
+    while ((m = re.exec(str)) !== null) {
+      tokens.push({ word: m[0], start: m.index, end: m.index + m[0].length });
+    }
+    return tokens;
+  }
+
+  /* Index of the token being spoken for a given charIndex, or -1. */
+  function wordIndexAt(charIndex, tokens) {
+    if (!tokens || !tokens.length) return -1;
+    if (typeof charIndex !== 'number' || isNaN(charIndex)) return -1;
+    for (var i = 0; i < tokens.length; i++) {
+      if (charIndex >= tokens[i].start && charIndex < tokens[i].end) return i;
+    }
+    /* charIndex in the gap between words -> next word */
+    for (var j = 0; j < tokens.length; j++) {
+      if (charIndex < tokens[j].start) return j;
+    }
+    return tokens.length - 1;
+  }
+
+  /*
+   * Long-text chunking: split into utterances no longer than maxLen.
+   * Prefers sentence ends, then clause punctuation, then word boundaries.
+   * Returns [] for empty/invalid input.
+   */
+  function chunkText(text, maxLen) {
+    var limit = (typeof maxLen === 'number' && isFinite(maxLen) && maxLen > 0)
+      ? Math.min(Math.floor(maxLen), MAX_CHUNK_LIMIT)
+      : DEFAULT_MAX_CHUNK;
+    var clean = normalizeText(text);
+    if (!clean) return [];
+
+    /* split into sentences first */
+    var sentences = clean.match(/[^.!?]+[.!?]+["')\]]*\s*|[^.!?]+$/g) || [clean];
+    var chunks = [];
+    var current = '';
+
+    function pushCurrent() {
+      var t = current.trim();
+      if (t) chunks.push(t);
+      current = '';
+    }
+
+    function addLongPiece(piece) {
+      /* a single sentence longer than the limit: split on clauses, then words */
+      var rest = piece.trim();
+      while (rest.length > limit) {
+        var window = rest.slice(0, limit);
+        var cut = Math.max(
+          window.lastIndexOf(', '),
+          window.lastIndexOf('; '),
+          window.lastIndexOf(': ')
+        );
+        if (cut < Math.floor(limit * 0.4)) cut = window.lastIndexOf(' ');
+        if (cut <= 0) cut = limit; /* pathological single word: hard cut */
+        var head = rest.slice(0, cut).replace(/[,\s]+$/, '').trim();
+        if (head) chunks.push(head);
+        rest = rest.slice(cut).replace(/^[\s,;:]+/, '').trim();
+      }
+      if (rest) {
+        if (current && (current + ' ' + rest).length <= limit) {
+          current = current + ' ' + rest;
+        } else {
+          pushCurrent();
+          current = rest;
+        }
+      }
+    }
+
+    for (var i = 0; i < sentences.length; i++) {
+      var s = sentences[i].trim();
+      if (!s) continue;
+      if (s.length > limit) {
+        pushCurrent();
+        addLongPiece(s);
+      } else if (!current) {
+        current = s;
+      } else if ((current + ' ' + s).length <= limit) {
+        current = current + ' ' + s;
+      } else {
+        pushCurrent();
+        current = s;
+      }
+    }
+    pushCurrent();
+    return chunks;
+  }
+
+  function clampRate(v) {
+    var n = parseFloat(v);
+    if (isNaN(n)) return 1;
+    return Math.min(2, Math.max(0.5, n));
+  }
+
+  function clampPitch(v) {
+    var n = parseFloat(v);
+    if (isNaN(n)) return 1;
+    return Math.min(2, Math.max(0, n));
+  }
+
+  /* Estimated reading time in seconds at the given rate multiplier. */
+  function estimateSeconds(text, rate) {
+    var words = countWords(text);
+    if (!words) return 0;
+    var r = clampRate(rate);
+    return Math.round((words / (BASE_WPM * r)) * 60);
+  }
+
+  function formatDuration(totalSeconds) {
+    var s = Math.max(0, Math.round(Number(totalSeconds) || 0));
+    var m = Math.floor(s / 60);
+    var rem = s % 60;
+    if (m === 0) return rem + ' sec';
+    return m + ' min ' + (rem < 10 ? '0' : '') + rem + ' sec';
+  }
+
+  /* Character offsets of each chunk inside the token stream (for resume/highlight). */
+  function chunkWordRanges(chunks) {
+    var ranges = [];
+    var cursor = 0;
+    (chunks || []).forEach(function (c) {
+      var n = countWords(c);
+      ranges.push({ startWord: cursor, endWord: cursor + n - 1, words: n });
+      cursor += n;
+    });
+    return ranges;
+  }
+
+  return {
+    BASE_WPM: BASE_WPM,
+    DEFAULT_MAX_CHUNK: DEFAULT_MAX_CHUNK,
+    normalizeText: normalizeText,
+    countWords: countWords,
+    tokenizeWords: tokenizeWords,
+    wordIndexAt: wordIndexAt,
+    chunkText: chunkText,
+    clampRate: clampRate,
+    clampPitch: clampPitch,
+    estimateSeconds: estimateSeconds,
+    formatDuration: formatDuration,
+    chunkWordRanges: chunkWordRanges
+  };
+})();
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = SpeaklyLib;
+}
+
+</script>
+</head>
+<body id="top" class="min-h-screen flex flex-col">
+
+<!-- HEADER -->
+<header class="sticky top-0 z-40 bg-[#FFF7ED]/90 backdrop-blur border-b border-orange-200">
+  <div class="mx-auto max-w-6xl px-4 sm:px-6 h-16 flex items-center justify-between">
+    <a href="#top" class="flex items-center gap-2.5">
+      <span class="w-9 h-9 rounded-full disc flex items-center justify-center text-white text-lg shadow" aria-hidden="true">🔊</span>
+      <span class="text-xl font-extrabold tracking-tight">Speak<span class="text-orange-600">ly</span></span>
+    </a>
+    <nav class="flex items-center gap-2 sm:gap-4 text-sm font-semibold">
+      <a href="#top" class="px-3 py-2 rounded-full hover:bg-orange-100 transition">Home</a>
+      <a href="https://fixoraa.tech" class="px-3 py-2 rounded-full bg-orange-600 text-white hover:bg-orange-700 transition shadow">More Tools</a>
+    </nav>
+  </div>
+</header>
+
+<!-- TOP AD -->
+<div class="no-print mx-auto max-w-6xl px-4 sm:px-6 pt-4" role="complementary" aria-label="Advertisement">
+  <div class="mx-auto text-center" style="max-width:728px">
+    <span class="block text-[10px] tracking-[0.18em] uppercase text-slate-400 mb-1.5">Advertisement</span>
+    <div class="flex justify-center overflow-hidden">
+      <div class="origin-top scale-[0.44] sm:scale-100 shrink-0">
+        <script>
+          atOptions = { 'key' : '4e68ac77881c17fe128a46565d9a4e8c', 'format' : 'iframe', 'height' : 90, 'width' : 728, 'params' : {} };
+        </script>
+        <script src="https://www.highrevenueformat.com/4e68ac77881c17fe128a46565d9a4e8c/invoke.js"></script>
+      </div>
+    </div>
+  </div>
+</div>
+
+<main class="flex-1 w-full">
+  <!-- HERO -->
+  <section class="mx-auto max-w-6xl px-4 sm:px-6 pt-8 pb-4 text-center">
+    <span class="inline-flex items-center gap-1.5 bg-orange-100 border border-orange-300 text-orange-800 text-xs font-bold px-3 py-1.5 rounded-full">✦ Unlimited Free Usage · No signup · No watermark</span>
+    <h1 class="mt-4 text-4xl sm:text-5xl font-extrabold tracking-tight leading-tight">Press play. <span class="text-transparent bg-clip-text sunset-grad">Hear your words.</span></h1>
+    <p class="mt-3 max-w-2xl mx-auto text-orange-900/70 text-base sm:text-lg">Speakly turns any text into natural spoken audio using the voices already on your device — with a live word-by-word highlight so your eyes can follow your ears.</p>
+  </section>
+
+  <!-- PLAYER STAGE -->
+  <section class="mx-auto max-w-6xl px-4 sm:px-6 pb-6" aria-label="Text to speech player">
+    <div id="stage" class="idle relative overflow-hidden rounded-[2rem] sunset-grad stage-shadow text-white">
+      <div class="absolute inset-0 opacity-20 pointer-events-none" style="background:radial-gradient(600px 200px at 20% 0%,#fff,transparent 60%)"></div>
+      <div class="relative grid md:grid-cols-[240px_1fr] gap-6 p-5 sm:p-8 items-center">
+        <!-- Vinyl / now playing -->
+        <div class="flex md:flex-col items-center gap-4">
+          <div id="disc" class="relative w-24 h-24 md:w-44 md:h-44 rounded-full disc border-4 border-white/30 shadow-2xl shrink-0 flex items-center justify-center">
+            <div class="w-10 h-10 md:w-16 md:h-16 rounded-full bg-[#FFF7ED] flex items-center justify-center text-xl md:text-3xl">🎙️</div>
+          </div>
+          <div class="md:text-center">
+            <p class="text-[11px] uppercase tracking-[0.22em] text-orange-100/90 font-bold">Now playing</p>
+            <p id="nowPlaying" class="font-bold text-base md:text-lg leading-snug mt-0.5">Nothing queued yet</p>
+            <p id="voiceEcho" class="text-orange-100/80 text-xs mt-1">Pick a voice below to begin</p>
+          </div>
+        </div>
+        <!-- Transport -->
+        <div>
+          <div class="flex items-end gap-1 h-10 mb-4" aria-hidden="true">
+            <span class="eqbar w-1.5 rounded bg-white/90" style="height:100%;animation-delay:0s"></span>
+            <span class="eqbar w-1.5 rounded bg-white/70" style="height:70%;animation-delay:.15s"></span>
+            <span class="eqbar w-1.5 rounded bg-amber-200" style="height:90%;animation-delay:.3s"></span>
+            <span class="eqbar w-1.5 rounded bg-white/80" style="height:55%;animation-delay:.45s"></span>
+            <span class="eqbar w-1.5 rounded bg-white/60" style="height:85%;animation-delay:.6s"></span>
+            <span class="eqbar w-1.5 rounded bg-amber-100" style="height:65%;animation-delay:.75s"></span>
+            <span class="eqbar w-1.5 rounded bg-white/90" style="height:95%;animation-delay:.9s"></span>
+            <span class="eqbar w-1.5 rounded bg-white/50" style="height:50%;animation-delay:.2s"></span>
+            <span class="eqbar w-1.5 rounded bg-white/80" style="height:75%;animation-delay:.5s"></span>
+            <span class="eqbar w-1.5 rounded bg-amber-200" style="height:60%;animation-delay:.8s"></span>
+          </div>
+          <div class="flex flex-wrap items-center gap-3">
+            <button id="playBtn" class="w-16 h-16 rounded-full bg-white text-orange-700 text-3xl shadow-xl hover:scale-105 active:scale-95 transition flex items-center justify-center" aria-label="Play">▶</button>
+            <button id="pauseBtn" class="px-5 h-12 rounded-full bg-white/15 border border-white/40 backdrop-blur font-bold hover:bg-white/25 transition disabled:opacity-40 disabled:cursor-not-allowed" disabled>⏸ Pause</button>
+            <button id="stopBtn" class="px-5 h-12 rounded-full bg-white/15 border border-white/40 backdrop-blur font-bold hover:bg-white/25 transition disabled:opacity-40 disabled:cursor-not-allowed" disabled>⏹ Stop</button>
+            <button id="restartBtn" class="px-5 h-12 rounded-full bg-white/15 border border-white/40 backdrop-blur font-bold hover:bg-white/25 transition">↺ Restart</button>
+          </div>
+          <div class="mt-5">
+            <div class="flex justify-between text-xs font-semibold text-orange-50/90 mb-1.5">
+              <span id="progressLabel">0 of 0 words</span>
+              <span id="timeLabel">Est. 0 sec</span>
+            </div>
+            <div class="h-2.5 rounded-full bg-black/25 overflow-hidden" role="progressbar" aria-label="Listening progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressWrap">
+              <div id="progressBar" class="h-full w-0 bg-gradient-to-r from-amber-200 to-white rounded-full transition-all duration-200"></div>
+            </div>
+          </div>
+          <p id="playerMsg" class="mt-3 text-sm text-amber-100 min-h-[1.25rem]" role="status"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- CONTROLS + TEXT -->
+    <div class="grid lg:grid-cols-[1fr_360px] gap-6 mt-6 items-start">
+      <!-- Script editor -->
+      <div class="bg-white rounded-3xl border border-orange-200 shadow-sm overflow-hidden">
+        <div class="flex flex-wrap items-center justify-between gap-2 px-5 pt-4">
+          <h2 class="font-extrabold text-lg">Your script</h2>
+          <div class="flex gap-2">
+            <button class="sampleBtn chip text-xs font-bold border border-orange-300 rounded-full px-3 py-1.5 hover:bg-orange-50" data-sample="welcome">Sample: Welcome</button>
+            <button class="sampleBtn chip text-xs font-bold border border-orange-300 rounded-full px-3 py-1.5 hover:bg-orange-50" data-sample="story">Sample: Short story</button>
+            <button id="clearBtn" class="chip text-xs font-bold border border-orange-300 rounded-full px-3 py-1.5 hover:bg-orange-50">Clear</button>
+          </div>
+        </div>
+        <div class="px-5 pb-2">
+          <label for="inputText" class="sr-only">Text to read aloud</label>
+          <textarea id="inputText" rows="8" placeholder="Paste an article, type your notes, or drop in a chapter… then press play." class="w-full mt-3 rounded-2xl border border-orange-200 bg-orange-50/50 focus:bg-white focus:ring-2 focus:ring-orange-400 focus:border-orange-400 outline-none p-4 text-[15px] leading-relaxed resize-y"></textarea>
+          <div class="flex flex-wrap gap-x-5 gap-y-1 text-xs text-orange-900/60 font-semibold pb-3">
+            <span><span id="statWords">0</span> words</span>
+            <span><span id="statChars">0</span> characters</span>
+            <span><span id="statChunks">0</span> listening chunks</span>
+            <span>Listen time ≈ <span id="statTime">0 sec</span></span>
+          </div>
+        </div>
+        <!-- Reader panel -->
+        <div class="border-t border-orange-100 bg-[#FFFBF5] px-5 py-4">
+          <div class="flex items-center justify-between">
+            <h3 class="font-bold text-sm uppercase tracking-wider text-orange-800">Follow-along reader</h3>
+            <button id="copyBtn" class="chip text-xs font-bold border border-orange-300 rounded-full px-3 py-1.5 bg-white hover:bg-orange-50">Copy text</button>
+          </div>
+          <div id="readerPanel" class="serif mt-3 text-lg leading-loose text-orange-950/85 max-h-64 overflow-y-auto pr-1">
+            <p class="text-orange-900/40 text-base">Your words will light up here, one by one, as they are spoken.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Voice console -->
+      <aside class="bg-[#431407] text-orange-50 rounded-3xl shadow-lg p-5 sm:p-6 lg:sticky lg:top-24">
+        <h2 class="font-extrabold text-lg flex items-center gap-2">🎚️ Voice console</h2>
+
+        <label for="voiceSelect" class="block mt-5 text-xs font-bold uppercase tracking-wider text-orange-300">System voice</label>
+        <select id="voiceSelect" class="mt-2 w-full rounded-xl bg-orange-950 border border-orange-800 focus:ring-2 focus:ring-amber-400 outline-none px-3 py-3 text-sm text-orange-50"></select>
+        <p id="voiceMeta" class="mt-1.5 text-xs text-orange-300/80">Loading voices from your device…</p>
+
+        <label for="langFilter" class="block mt-4 text-xs font-bold uppercase tracking-wider text-orange-300">Language filter</label>
+        <select id="langFilter" class="mt-2 w-full rounded-xl bg-orange-950 border border-orange-800 focus:ring-2 focus:ring-amber-400 outline-none px-3 py-3 text-sm text-orange-50">
+          <option value="">All languages</option>
+        </select>
+
+        <div class="mt-6">
+          <div class="flex justify-between items-baseline">
+            <label for="rateRange" class="text-xs font-bold uppercase tracking-wider text-orange-300">Speaking rate</label>
+            <span id="rateVal" class="font-extrabold text-amber-300">1.00×</span>
+          </div>
+          <input id="rateRange" type="range" min="0.5" max="2" step="0.05" value="1" class="w-full mt-2" aria-label="Speaking rate">
+          <div class="flex gap-2 mt-3">
+            <button class="ratePreset chip flex-1 text-xs font-bold border border-orange-700 rounded-full py-1.5 hover:bg-orange-900" data-rate="0.75">0.75× Study</button>
+            <button class="ratePreset chip flex-1 text-xs font-bold border border-orange-700 rounded-full py-1.5 hover:bg-orange-900" data-rate="1">1× Normal</button>
+            <button class="ratePreset chip flex-1 text-xs font-bold border border-orange-700 rounded-full py-1.5 hover:bg-orange-900" data-rate="1.5">1.5× Skim</button>
+          </div>
+        </div>
+
+        <div class="mt-6">
+          <div class="flex justify-between items-baseline">
+            <label for="pitchRange" class="text-xs font-bold uppercase tracking-wider text-orange-300">Pitch</label>
+            <span id="pitchVal" class="font-extrabold text-amber-300">1.00</span>
+          </div>
+          <input id="pitchRange" type="range" min="0" max="2" step="0.05" value="1" class="w-full mt-2" aria-label="Pitch">
+          <p class="text-xs text-orange-300/70 mt-2">Lower pitch sounds deeper and calmer; higher pitch sounds brighter and more energetic. Some voices respond more strongly than others.</p>
+        </div>
+
+        <div class="mt-6 rounded-2xl bg-orange-950/70 border border-orange-800 p-4 text-xs leading-relaxed text-orange-200/90">
+          <p class="font-bold text-orange-100 mb-1">🔒 Private by design</p>
+          Speakly uses your browser's built-in speech engine. Your text is never uploaded, recorded, or sent to a server — listening happens entirely on your device.
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- BOTTOM AD -->
+<div class="no-print mx-auto max-w-6xl px-4 sm:px-6 pb-4" role="complementary" aria-label="Advertisement">
+  <div class="mx-auto text-center" style="max-width:728px">
+    <span class="block text-[10px] tracking-[0.18em] uppercase text-slate-400 mb-1.5">Advertisement</span>
+    <div class="flex justify-center overflow-hidden">
+      <script async src="https://js.wpadmngr.com/static/adManager.js" data-admpid="464498"></script>
+    </div>
+  </div>
+</div>
+
+  <!-- SEO ARTICLE -->
+  <article class="mx-auto max-w-4xl px-4 sm:px-6 py-10">
+    <h2 class="text-3xl font-extrabold tracking-tight">Text to Speech, Explained: How Speakly Reads Anything Aloud for Free</h2>
+    <p class="serif mt-5 text-lg leading-relaxed text-orange-950/85">Text to speech — often shortened to TTS — is the technology that converts written words into spoken audio. What began in the 1960s as robotic, barely intelligible experiments has become one of the most quietly useful tools on the modern web. Today, every major operating system ships with a capable speech engine built in, and Speakly puts that engine on a stage: paste any text, choose a voice, adjust the pace and tone, press play, and listen while the current word lights up on screen. This guide explains how text to speech works, who benefits from it, how to get the most natural sound from it, and why a follow-along word highlight makes such a difference to comprehension.</p>
+
+    <h3 class="text-2xl font-bold mt-8">How text to speech actually works</h3>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">When you press play in Speakly, your browser hands the text to the speech synthesizer built into your device — the same engine behind screen readers and voice assistants. That engine first normalizes the text: it expands numbers, abbreviations, and symbols into speakable words, so "Dr. Smith arrived at 5 p.m." becomes something a voice can actually pronounce. Next it breaks the sentence into phonemes, the smallest units of sound in a language, and plans the prosody — the rhythm, stress, and intonation that make speech sound human rather than mechanical. Finally, the voice itself renders those sounds. Older voices stitched together tiny recorded fragments; modern neural voices, like the ones included in recent versions of Chrome, Edge, macOS, and Android, generate the waveform with machine-learning models trained on hours of real narration. That is why a voice on a new phone can sound startlingly close to a person reading in the room with you.</p>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">Because Speakly runs entirely in your browser through the Web Speech API, nothing you paste is uploaded anywhere. The voices available in the picker are exactly the voices installed on your device, which is why the list differs between a Windows laptop, an iPhone, and an Android tablet. Some browsers also offer network voices that stream from the cloud for higher quality; your device marks those in its own voice list. Either way, there is no account, no file conversion queue, and no waiting — synthesis starts the moment you press play.</p>
+
+    <h3 class="text-2xl font-bold mt-8">Why listening beats re-reading more often than you think</h3>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">Reading is a visual skill, but comprehension is not purely visual. Listening engages a different channel, and for many tasks it is simply the better channel. Students use text to speech to proofread essays, because errors that the eye skips — a doubled word, a missing "not," an awkward sentence that runs too long — become obvious when heard aloud. Language learners listen to correct pronunciation while following the highlighted text, binding sound to spelling far faster than either activity alone. Busy professionals turn long reports, documentation, and newsletters into something they can absorb on a walk, in the kitchen, or during a commute, reclaiming hours that would otherwise be lost to a screen.</p>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">Accessibility is the deepest reason of all. For readers with dyslexia, low vision, ADHD, or other print disabilities, hearing text while watching each word highlight can transform reading from a struggle into a routine. Research on bimodal reading — presenting text visually and audibly at the same time — consistently shows improved word recognition and retention for developing readers. Speakly's follow-along reader was designed with exactly this in mind: the spoken word glows amber on the page, finished words soften, and upcoming words stay quiet, so your eyes always know where your ears are.</p>
+
+    <h3 class="text-2xl font-bold mt-8">The voice picker: finding a voice you actually like</h3>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">Not all synthetic voices are equal, and the single biggest upgrade to your listening experience is choosing a good one. Most devices include at least one high-quality voice per language, and many include dozens. In Speakly, the voice picker lists every voice your system offers, and the language filter narrows the list instantly — useful when your device ships with forty voices but you only ever read in two languages. As a rule, voices labelled "natural," "neural," "premium," or "enhanced" sound noticeably smoother than the compact defaults installed for size reasons. If you read in multiple languages, match the voice to the text's language: an English voice reading Spanish will pronounce every word as if it were English, which is intelligible but rarely pleasant, while a Spanish voice will roll through the same paragraph beautifully.</p>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">Gender, age, and accent are matters of taste, and they genuinely affect stamina. A voice you find grating at minute one will be unbearable at minute forty, so it is worth spending a moment sampling two or three candidates on a paragraph you know well. Many listeners prefer a slightly lower-pitched voice for long nonfiction and a brighter voice for dialogue-heavy fiction. Speakly remembers nothing between visits — your text stays yours — but your browser typically keeps your chosen system defaults, so the picker tends to start near a voice you already trust.</p>
+
+    <h3 class="text-2xl font-bold mt-8">Rate and pitch: the two sliders that change everything</h3>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">Speaking rate is measured here as a multiplier of the voice's natural pace. At 1×, most voices read at roughly 160 to 175 words per minute, close to comfortable conversational speed and ideal for dense or technical material. Dropping to 0.75× slows the narration enough to study, transcribe, or learn pronunciation — language learners often go slower still. Raising the rate to 1.5× or beyond is the listener's equivalent of skimming: ideal for news, email triage, and re-reading familiar material, though comprehension of new, complex ideas falls off quickly above about 1.75×. Speakly's presets — Study, Normal, and Skim — cover the three speeds most people actually use, and the estimated listening time updates live as you drag, so you always know whether that article fits into your walk.</p>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">Pitch shifts the voice up or down without changing its speed. Small adjustments, a tenth or two either way, can rescue a voice that sounds almost right: slightly lower pitch often adds authority and calm for presentations and study notes, while slightly higher pitch adds energy that suits children's stories and dialogue. Extreme pitch values sound cartoonish on most voices — entertaining for a chapter of a comic novel, less so for a legal contract. Because pitch interacts with each voice's design, treat the slider as seasoning: adjust, listen to one sentence, and adjust again.</p>
+
+    <h3 class="text-2xl font-bold mt-8">Long texts and the chunking trick</h3>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">Every speech engine has limits. Hand a browser a 10,000-word chapter in a single request and some engines stall, skip, or stop mid-sentence — a well-known quirk that has frustrated listeners for years. Speakly solves this with long-text chunking. Before playback begins, your text is split into short, self-contained passages of about 180 characters, cut at sentence boundaries wherever possible and at commas or word boundaries when a single sentence runs long. The player then speaks the chunks back-to-back like tracks on an album, and the progress bar counts words across the whole piece, so a forty-minute listen flows without babysitting. Chunking also makes pausing and restarting precise: stop anywhere, press play, and Speakly resumes cleanly from a sensible boundary instead of garbling a half-finished sentence.</p>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">This design means there is no practical length limit. Paste an entire research paper, a full chapter of a public-domain novel, your complete lecture notes, or a long email thread — the stats line tells you how many chunks it became and how long the full listen will take at your chosen speed. If the estimate says twelve minutes, you genuinely have a twelve-minute audio companion, generated fresh on your device, for free.</p>
+
+    <h3 class="text-2xl font-bold mt-8">Practical ways people use Speakly every day</h3>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">Writers and editors use it as a ruthless proofreader, hearing clunky sentences the eye forgives. Students convert lecture slides and textbook sections into audio for revision walks, slowing difficult passages and speeding through review. Teachers play passages aloud in class while students follow the highlight, modelling fluent reading. Content creators draft scripts and listen back to check timing and tone before recording. Job seekers rehearse interview answers by hearing their written responses spoken in a neutral voice. Accessibility users make it their default reader for everything from news to bank letters. And countless listeners simply prefer their long reads as audio: research digests with morning coffee, documentation during chores, newsletters on the train.</p>
+    <p class="serif mt-3 text-lg leading-relaxed text-orange-950/85">To get the best results, prepare your text lightly. Remove navigation menus, cookie notices, and page clutter copied along with an article, since the voice will faithfully read all of it. Break giant walls of text with paragraph spacing, spell out unusual abbreviations the first time, and write numbers the way you want them heard if the automatic expansion guesses wrong. Then choose your voice, set a pace that matches the material, and let the highlight carry your attention. Listening is the oldest way humans have taken in stories and knowledge; Speakly simply gives that ancient channel a play button.</p>
+
+    <h3 class="text-2xl font-bold mt-10">Frequently asked questions</h3>
+    <div class="mt-5 space-y-3">
+      <details class="bg-white rounded-2xl border border-orange-200 p-5">
+        <summary class="font-bold cursor-pointer">Is Speakly really free, with no limits?</summary>
+        <p class="serif mt-2 text-orange-950/80 leading-relaxed">Yes. Speakly is completely free with unlimited usage — no signup, no word caps, no paywall, and no watermark. It works by using the text-to-speech voices already built into your browser and device, so there is no server cost to pass on to you and nothing to unlock.</p>
+      </details>
+      <details class="bg-white rounded-2xl border border-orange-200 p-5">
+        <summary class="font-bold cursor-pointer">Which voices can I choose from?</summary>
+        <p class="serif mt-2 text-orange-950/80 leading-relaxed">The voice picker lists every speech voice installed on your device, across all languages, and the language filter helps you narrow the list. The exact voices depend on your system: Windows, macOS, iOS, Android, and Chrome all ship different sets, and browsers like Edge and Chrome add their own natural-sounding options.</p>
+      </details>
+      <details class="bg-white rounded-2xl border border-orange-200 p-5">
+        <summary class="font-bold cursor-pointer">How does the word-by-word highlighting work?</summary>
+        <p class="serif mt-2 text-orange-950/80 leading-relaxed">Speakly builds a follow-along reader from your text and listens for word-boundary signals from the speech engine as it talks. The word currently being spoken glows amber, words already read fade softly, and the reader scrolls to keep pace. On the rare engine that does not send boundary signals, Speakly falls back to a timing estimate based on your chosen rate so the highlight keeps moving.</p>
+      </details>
+      <details class="bg-white rounded-2xl border border-orange-200 p-5">
+        <summary class="font-bold cursor-pointer">Can Speakly read very long articles or whole chapters?</summary>
+        <p class="serif mt-2 text-orange-950/80 leading-relaxed">Yes — that is what its long-text chunking is for. Before playback, your text is split into short passages at sentence boundaries, and the player speaks them seamlessly one after another. This avoids the stalls and cut-offs some speech engines hit with very long single requests, so there is no practical length limit.</p>
+      </details>
+      <details class="bg-white rounded-2xl border border-orange-200 p-5">
+        <summary class="font-bold cursor-pointer">Is my text private when I use Speakly?</summary>
+        <p class="serif mt-2 text-orange-950/80 leading-relaxed">Yes. Speakly runs entirely in your browser and never uploads, stores, or records your text. Speech is generated by your own device's built-in engine. Some browsers offer optional network voices that stream text to their provider for higher quality; if you pick a local voice, everything stays on your device.</p>
+      </details>
+      <details class="bg-white rounded-2xl border border-orange-200 p-5">
+        <summary class="font-bold cursor-pointer">What do the rate and pitch sliders do?</summary>
+        <p class="serif mt-2 text-orange-950/80 leading-relaxed">Rate controls speaking speed from half speed (0.5×) for study and dictation up to double speed (2×) for skimming, with presets for study, normal listening, and skimming. Pitch raises or lowers the voice's tone without changing speed — slightly lower sounds calmer, slightly higher sounds brighter. The estimated listening time updates as you adjust the rate.</p>
+      </details>
+    </div>
+  </article>
+</main>
+
+<footer class="border-t border-orange-200 bg-orange-100/60">
+  <div class="mx-auto max-w-6xl px-4 sm:px-6 py-6 flex flex-col sm:flex-row items-center justify-between gap-3 text-sm text-orange-900/70">
+    <p><span class="font-extrabold text-orange-950">Speakly</span> — your words, out loud. Free forever.</p>
+    <p>Made for listeners, learners, and proofreaders everywhere.</p>
+  </div>
+</footer>
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "Is Speakly really free, with no limits?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Speakly is completely free with unlimited usage — no signup, no word caps, no paywall, and no watermark. It works by using the text-to-speech voices already built into your browser and device, so there is no server cost to pass on to you and nothing to unlock." } },
+    { "@type": "Question", "name": "Which voices can I choose from?", "acceptedAnswer": { "@type": "Answer", "text": "The voice picker lists every speech voice installed on your device, across all languages, and the language filter helps you narrow the list. The exact voices depend on your system: Windows, macOS, iOS, Android, and Chrome all ship different sets, and browsers like Edge and Chrome add their own natural-sounding options." } },
+    { "@type": "Question", "name": "How does the word-by-word highlighting work?", "acceptedAnswer": { "@type": "Answer", "text": "Speakly builds a follow-along reader from your text and listens for word-boundary signals from the speech engine as it talks. The word currently being spoken glows amber, words already read fade softly, and the reader scrolls to keep pace. On the rare engine that does not send boundary signals, Speakly falls back to a timing estimate based on your chosen rate so the highlight keeps moving." } },
+    { "@type": "Question", "name": "Can Speakly read very long articles or whole chapters?", "acceptedAnswer": { "@type": "Answer", "text": "Yes — that is what its long-text chunking is for. Before playback, your text is split into short passages at sentence boundaries, and the player speaks them seamlessly one after another. This avoids the stalls and cut-offs some speech engines hit with very long single requests, so there is no practical length limit." } },
+    { "@type": "Question", "name": "Is my text private when I use Speakly?", "acceptedAnswer": { "@type": "Answer", "text": "Yes. Speakly runs entirely in your browser and never uploads, stores, or records your text. Speech is generated by your own device's built-in engine. Some browsers offer optional network voices that stream text to their provider for higher quality; if you pick a local voice, everything stays on your device." } },
+    { "@type": "Question", "name": "What do the rate and pitch sliders do?", "acceptedAnswer": { "@type": "Answer", "text": "Rate controls speaking speed from half speed (0.5×) for study and dictation up to double speed (2×) for skimming, with presets for study, normal listening, and skimming. Pitch raises or lowers the voice's tone without changing speed — slightly lower sounds calmer, slightly higher sounds brighter. The estimated listening time updates as you adjust the rate." } }
+  ]
+}
+</script>
+
+<script>
+(function () {
+  'use strict';
+  var L = window.SpeaklyLib || SpeaklyLib;
+  var synth = window.speechSynthesis || null;
+
+  var el = function (id) { return document.getElementById(id); };
+  var input = el('inputText'), reader = el('readerPanel'), stage = el('stage'), disc = el('disc');
+  var voiceSelect = el('voiceSelect'), langFilter = el('langFilter'), voiceMeta = el('voiceMeta'), voiceEcho = el('voiceEcho');
+  var rateRange = el('rateRange'), pitchRange = el('pitchRange'), rateVal = el('rateVal'), pitchVal = el('pitchVal');
+  var playBtn = el('playBtn'), pauseBtn = el('pauseBtn'), stopBtn = el('stopBtn');
+  var progressBar = el('progressBar'), progressLabel = el('progressLabel'), timeLabel = el('timeLabel'), progressWrap = el('progressWrap');
+  var msg = el('playerMsg'), nowPlaying = el('nowPlaying');
+
+  var SAMPLES = {
+    welcome: 'Welcome to Speakly. Paste any text on the left, choose a voice you love, and press play. Watch each word light up as it is spoken. Slow the rate down to study, or speed it up to skim a long article on your walk.',
+    story: 'The sun was setting over the harbour when Mara found the letter. It had been tucked inside an old library book for thirty years, waiting for someone patient enough to read to the very last page. She opened it slowly, and began to read aloud.'
+  };
+
+  var allVoices = [];
+  var state = {
+    playing: false, paused: false, chunks: [], chunkIdx: 0,
+    tokens: [], wordSpans: [], ranges: [], currentWord: -1,
+    fallbackTimer: null, boundarySeen: false, keepAlive: null
+  };
+
+  function setMsg(t) { msg.textContent = t || ''; }
+
+  function rate() { return L.clampRate(parseFloat(rateRange.value)); }
+  function pitch() { return L.clampPitch(parseFloat(pitchRange.value)); }
+
+  /* ---------- stats + reader rebuild ---------- */
+  function refreshStats() {
+    var text = input.value;
+    var words = L.countWords(text);
+    var chunks = L.chunkText(text);
+    el('statWords').textContent = words;
+    el('statChars').textContent = text.length;
+    el('statChunks').textContent = chunks.length;
+    var secs = L.estimateSeconds(text, rate());
+    el('statTime').textContent = L.formatDuration(secs);
+    timeLabel.textContent = 'Est. ' + L.formatDuration(secs);
+    if (!state.playing) {
+      progressLabel.textContent = '0 of ' + words + ' words';
+      progressBar.style.width = '0%';
+      progressWrap.setAttribute('aria-valuenow', '0');
+    }
+    buildReader(text);
+    if (!state.playing) {
+      nowPlaying.textContent = words ? ('"' + L.normalizeText(text).slice(0, 60) + (L.normalizeText(text).length > 60 ? '…' : '') + '"') : 'Nothing queued yet';
+    }
+  }
+
+  function buildReader(text) {
+    state.tokens = L.tokenizeWords(text);
+    reader.innerHTML = '';
+    state.wordSpans = [];
+    if (!state.tokens.length) {
+      reader.innerHTML = '<p class="text-orange-900/40 text-base">Your words will light up here, one by one, as they are spoken.</p>';
+      return;
+    }
+    var frag = document.createDocumentFragment();
+    var cursor = 0;
+    state.tokens.forEach(function (tok, i) {
+      if (tok.start > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, tok.start)));
+      var s = document.createElement('span');
+      s.className = 'word';
+      s.textContent = tok.word;
+      frag.appendChild(s);
+      state.wordSpans.push(s);
+      cursor = tok.end;
+    });
+    if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
+    reader.appendChild(frag);
+  }
+
+  function highlight(globalIdx) {
+    if (globalIdx === state.currentWord) return;
+    if (state.currentWord >= 0 && state.wordSpans[state.currentWord]) {
+      state.wordSpans[state.currentWord].classList.remove('now');
+      state.wordSpans[state.currentWord].classList.add('spoken');
+    }
+    state.currentWord = globalIdx;
+    var span = state.wordSpans[globalIdx];
+    if (span) {
+      span.classList.add('now');
+      span.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+    var total = state.tokens.length;
+    var done = Math.min(globalIdx + 1, total);
+    progressLabel.textContent = done + ' of ' + total + ' words';
+    var pct = total ? Math.round((done / total) * 100) : 0;
+    progressBar.style.width = pct + '%';
+    progressWrap.setAttribute('aria-valuenow', String(pct));
+  }
+
+  /* ---------- voices ---------- */
+  function loadVoices() {
+    if (!synth) return;
+    allVoices = synth.getVoices() || [];
+    var langs = {};
+    allVoices.forEach(function (v) { if (v.lang) langs[v.lang] = true; });
+    var curLang = langFilter.value;
+    langFilter.innerHTML = '<option value="">All languages</option>';
+    Object.keys(langs).sort().forEach(function (lg) {
+      var o = document.createElement('option');
+      o.value = lg; o.textContent = lg;
+      langFilter.appendChild(o);
+    });
+    langFilter.value = curLang;
+    renderVoiceOptions();
+  }
+
+  function renderVoiceOptions() {
+    var prev = voiceSelect.value;
+    var filter = langFilter.value;
+    voiceSelect.innerHTML = '';
+    var list = allVoices.filter(function (v) { return !filter || v.lang === filter; });
+    if (!list.length) {
+      var o = document.createElement('option');
+      o.value = ''; o.textContent = 'No voices found on this device';
+      voiceSelect.appendChild(o);
+      voiceMeta.textContent = 'Your device reported no speech voices.';
+      voiceEcho.textContent = 'No voice available';
+      return;
+    }
+    list.forEach(function (v) {
+      var o = document.createElement('option');
+      o.value = v.name;
+      o.textContent = v.name + ' — ' + v.lang + (v.default ? ' (default)' : '');
+      voiceSelect.appendChild(o);
+    });
+    var names = list.map(function (v) { return v.name; });
+    voiceSelect.value = names.indexOf(prev) >= 0 ? prev : list[0].name;
+    updateVoiceMeta();
+  }
+
+  function selectedVoice() {
+    var name = voiceSelect.value;
+    for (var i = 0; i < allVoices.length; i++) if (allVoices[i].name === name) return allVoices[i];
+    return null;
+  }
+
+  function updateVoiceMeta() {
+    var v = selectedVoice();
+    if (!v) return;
+    voiceMeta.textContent = v.lang + ' · ' + (v.localService ? 'On-device voice' : 'Network voice') + ' · ' + allVoices.length + ' voices on this device';
+    voiceEcho.textContent = 'Voice: ' + v.name;
+  }
+
+  /* ---------- playback engine ---------- */
+  function stopFallback() {
+    if (state.fallbackTimer) { clearInterval(state.fallbackTimer); state.fallbackTimer = null; }
+  }
+  function stopKeepAlive() {
+    if (state.keepAlive) { clearInterval(state.keepAlive); state.keepAlive = null; }
+  }
+
+  function setTransport() {
+    pauseBtn.disabled = !state.playing;
+    stopBtn.disabled = !state.playing;
+    pauseBtn.textContent = state.paused ? '▶ Resume' : '⏸ Pause';
+    playBtn.textContent = state.playing && !state.paused ? '🔊' : '▶';
+    disc.classList.toggle('spinning', state.playing && !state.paused);
+    stage.classList.toggle('idle', !state.playing);
+    stage.classList.toggle('paused-anim', state.paused);
+  }
+
+  function finishPlayback(message) {
+    state.playing = false; state.paused = false;
+    stopFallback(); stopKeepAlive();
+    setTransport();
+    if (message) setMsg(message);
+  }
+
+  function startFallbackTicker(chunkStartWord, chunkWordCount) {
+    stopFallback();
+    var msPerWord = 60000 / (L.BASE_WPM * rate());
+    var startedAt = Date.now();
+    state.fallbackTimer = setInterval(function () {
+      if (state.boundarySeen || state.paused || !state.playing) return;
+      var idx = Math.floor((Date.now() - startedAt) / msPerWord);
+      if (idx >= chunkWordCount) { stopFallback(); return; }
+      highlight(chunkStartWord + idx);
+    }, 90);
+  }
+
+  function speakChunk(i) {
+    if (i >= state.chunks.length) {
+      highlight(state.tokens.length - 1);
+      finishPlayback('Finished. Press play to listen again.');
+      return;
+    }
+    state.chunkIdx = i;
+    state.boundarySeen = false;
+    var chunkText = state.chunks[i];
+    var range = state.ranges[i];
+    var u = new SpeechSynthesisUtterance(chunkText);
+    var v = selectedVoice();
+    if (v) { u.voice = v; u.lang = v.lang; }
+    u.rate = rate();
+    u.pitch = pitch();
+
+    var chunkTokens = L.tokenizeWords(chunkText);
+    u.onboundary = function (ev) {
+      if (typeof ev.charIndex !== 'number') return;
+      state.boundarySeen = true;
+      stopFallback();
+      var local = L.wordIndexAt(ev.charIndex, chunkTokens);
+      if (local >= 0) highlight(range.startWord + local);
+    };
+    u.onend = function () {
+      stopFallback();
+      if (!state.playing) return;
+      speakChunk(i + 1);
+    };
+    u.onerror = function (ev) {
+      stopFallback();
+      if (!state.playing) return;
+      if (ev.error === 'interrupted' || ev.error === 'canceled') return;
+      speakChunk(i + 1); /* skip a failing chunk rather than dying silently */
+    };
+    synth.speak(u);
+    highlight(range.startWord);
+    startFallbackTicker(range.startWord, range.words);
+    nowPlaying.textContent = 'Chunk ' + (i + 1) + ' of ' + state.chunks.length;
+  }
+
+  function play() {
+    if (!synth) { setMsg('Sorry — this browser does not support text to speech. Try Chrome, Edge, or Safari.'); return; }
+    if (state.playing && state.paused) { synth.resume(); state.paused = false; setTransport(); setMsg('Resumed.'); return; }
+    if (state.playing) return;
+    var text = input.value;
+    var chunks = L.chunkText(text);
+    if (!chunks.length) {
+      setMsg('Add some text first — paste an article or try one of the samples above.');
+      input.focus();
+      return;
+    }
+    synth.cancel();
+    buildReader(text);
+    state.chunks = chunks;
+    state.ranges = L.chunkWordRanges(chunks);
+    state.currentWord = -1;
+    state.wordSpans.forEach(function (s) { s.classList.remove('now', 'spoken'); });
+    state.playing = true; state.paused = false;
+    setTransport();
+    setMsg('Playing…');
+    /* Chrome long-utterance keep-alive */
+    stopKeepAlive();
+    state.keepAlive = setInterval(function () {
+      if (state.playing && !state.paused && synth.speaking) { synth.pause(); synth.resume(); }
+    }, 10000);
+    speakChunk(0);
+  }
+
+  function pauseToggle() {
+    if (!synth || !state.playing) return;
+    if (state.paused) { synth.resume(); state.paused = false; setMsg('Resumed.'); }
+    else { synth.pause(); state.paused = true; setMsg('Paused.'); }
+    setTransport();
+  }
+
+  function stopAll() {
+    if (!synth) return;
+    state.playing = false; state.paused = false;
+    synth.cancel();
+    stopFallback(); stopKeepAlive();
+    if (state.currentWord >= 0 && state.wordSpans[state.currentWord]) state.wordSpans[state.currentWord].classList.remove('now');
+    state.currentWord = -1;
+    progressBar.style.width = '0%';
+    progressLabel.textContent = '0 of ' + state.tokens.length + ' words';
+    setTransport();
+    setMsg('Stopped.');
+  }
+
+  /* ---------- wire up ---------- */
+  playBtn.addEventListener('click', play);
+  pauseBtn.addEventListener('click', pauseToggle);
+  stopBtn.addEventListener('click', stopAll);
+  el('restartBtn').addEventListener('click', function () { stopAll(); setTimeout(play, 60); });
+  el('clearBtn').addEventListener('click', function () { stopAll(); input.value = ''; refreshStats(); setMsg('Cleared. Paste fresh text whenever you are ready.'); });
+  el('copyBtn').addEventListener('click', function () {
+    var t = input.value;
+    if (!t) { setMsg('Nothing to copy yet — add some text first.'); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(function () { setMsg('Text copied to clipboard.'); }, function () { setMsg('Copy failed — select the text manually.'); });
+    } else { input.select(); document.execCommand('copy'); setMsg('Text copied to clipboard.'); }
+  });
+  document.querySelectorAll('.sampleBtn').forEach(function (b) {
+    b.addEventListener('click', function () { stopAll(); input.value = SAMPLES[b.getAttribute('data-sample')] || ''; refreshStats(); setMsg('Sample loaded — press play.'); });
+  });
+  document.querySelectorAll('.ratePreset').forEach(function (b) {
+    b.addEventListener('click', function () {
+      rateRange.value = b.getAttribute('data-rate');
+      syncSliders();
+      if (state.playing) { var pos = state.chunkIdx; stopAll(); state.chunks = L.chunkText(input.value); if (state.chunks.length) { state.playing = true; setTransport(); speakChunk(Math.min(pos, state.chunks.length - 1)); } }
+    });
+  });
+  function syncSliders() {
+    rateVal.textContent = rate().toFixed(2) + '×';
+    pitchVal.textContent = pitch().toFixed(2);
+    var txt = input.value;
+    var secs = L.estimateSeconds(txt, rate());
+    el('statTime').textContent = L.formatDuration(secs);
+    timeLabel.textContent = 'Est. ' + L.formatDuration(secs);
+  }
+  rateRange.addEventListener('input', syncSliders);
+  pitchRange.addEventListener('input', syncSliders);
+  input.addEventListener('input', function () { if (!state.playing) refreshStats(); });
+  langFilter.addEventListener('change', renderVoiceOptions);
+  voiceSelect.addEventListener('change', updateVoiceMeta);
+
+  if (synth) {
+    loadVoices();
+    if (typeof synth.onvoiceschanged !== 'undefined') synth.onvoiceschanged = loadVoices;
+  } else {
+    voiceSelect.innerHTML = '<option value="">Speech not supported in this browser</option>';
+    voiceMeta.textContent = 'Try Chrome, Edge, or Safari for built-in voices.';
+    setMsg('This browser has no speech engine — the reader above still works for pasting and timing your text.');
+  }
+  refreshStats();
+  syncSliders();
+  setTransport();
+})();
+</script>
+</body>
+</html>
